@@ -4,12 +4,11 @@ from typing import List
 from session import get_db
 import models
 import schemas
-from openai import OpenAI
-import json
+from langchain_core.prompts import ChatPromptTemplate
+from langchain.chat_models import init_chat_model
 
 
-client = OpenAI()
-router = APIRouter()
+router = APIRouter() # group related endpoints
 
 @router.post("/", response_model=schemas.JobPosting)
 def create_job_posting(job: schemas.JobPostingCreate, db: Session = Depends(get_db)):
@@ -68,97 +67,86 @@ def delete_job_posting(job_id: int, db: Session = Depends(get_db)):
     return {"message": "Job posting deleted successfully"} 
 
 
-# dictionary defines a function schema / OpenAI tool schema that is passed to the OpenAI API, 
-# for structured job description, instructing the model how to structure the response.
-# telling GPT Instead of writing free-form text, return the job description using this structured JSON format.
-job_description_function = {
-    "type": "function", # Instructs the model that this is a tool of type 'function'
-    "function": {
-        "name": "generate_structured_job_description", # The name of the function to be called
-        "description": "Generate a structured job description for an AI job",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "The title of the job"
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "A brief summary of the role"
-                },
-                "responsibilities": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "A list of key responsibilities"
-                },
-                "requirements": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "A list of key requirements or qualifications"
-                },
-                "tools": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Tools or technologies required for the role"
-                }
-            },
-            "required": ["title", "summary", "responsibilities", "requirements", "tools"]
-        }
+# endpoint to generate a structured job description using LangChain
+
+# input prompt that will be sent to the LLM. "user" message uses {placeholders} to dynamically insert job-related fields.
+prompt_template = ChatPromptTemplate.from_messages([
+    ("system", "You are a senior technical recruiter."),
+    ("user", """Generate a structured job description for the following AI role:
+
+Job Title: {job_title}
+Company: {company_name}
+Industry: {industry}
+Location: {location}
+Employment Type: {employment_type}
+Required Tools: {required_tools}
+
+Please include the following sections in your response:
+- Title
+- Summary
+- Responsibilities
+- Requirements
+- Qualifications
+- Benefits
+- Tools""")
+])
+
+
+# initialize a gpt-4o-mini model from OpenAI
+model = init_chat_model(
+    "gpt-4o-mini",
+    model_provider="openai",
+    temperature=0,
+    model_kwargs={
+        "max_tokens": 500,
+        "logprobs": True,
+        "top_logprobs": 4
     }
-}
+).with_structured_output(schemas.JobDescription) # tells LangChain to parse the model's response into a Pydantic model (JobDescription), ensuring consistency.
+
+chain = prompt_template | model # Combine Prompt and Model. Accepts prompt variables as input. Feeds them into the model.
 
 @router.post("/{job_id}/description", response_model=dict)
 def gen_job_description(job_id: int, payload: schemas.JobDescriptionRequest, db: Session = Depends(get_db)):
     job = db.query(models.JobPosting).filter(models.JobPosting.id == job_id).first()
     if job is None:
         raise HTTPException(status_code=404, detail="Job posting not found")
-    
+
     company = db.query(models.Company).filter(models.Company.id == job.company_id).first()
     if company is None:
         raise HTTPException(status_code=404, detail="Company not found")
 
-# Pass user + job + company info in a natural prompt format.
-    prompt = f"""
-    Generate a structured job description for the following AI role:
-    Job Title: {job.title}
-    Company: {company.name}
-    Industry: {company.industry}
-    Location: {job.location_type}
-    Employment Type: {job.employment_type}
-    Required Tools: {', '.join(payload.required_tools)}
-    """
 
-# send a chat-based prompt to an OpenAI model and receive a generated response
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are a senior technical recruiter."},
-            {"role": "user", "content": prompt}
-        ],
-        tools=[job_description_function], # tools parameter sends the schema.
-        tool_choice={"type": "function", "function": {"name": "generate_structured_job_description"}}
-    )
-
-    tool_call = response.choices[0].message.tool_calls[0]
-    structured_description = json.loads(tool_call.function.arguments)
-    #tool_call.function.arguments is a JSON string that contains the structured job description.
-    #json.loads() converts the JSON string into a Python dictionary.
-
-# store the full structured result into the description column of the JobPosting table.
+    structured_description = chain.invoke({ # Use LangChain to generate a structured job description. Calls the LLM with dynamic prompt variables.
+        "job_title": job.title,
+        "company_name": company.name,
+        "industry": company.industry,
+        "location": job.location_type,
+        "employment_type": job.employment_type,
+        "required_tools": ", ".join(payload.required_tools)
+    })
+# The result is parsed into a JobDescription Pydantic object because of .with_structured_output(schemas.JobDescription)
+# Combine structured fields into a human-readable job description string.
     job.description = (
-        structured_description["summary"] + "\n\n" +
-        "Responsibilities:\n" + "\n".join(structured_description["responsibilities"]) + "\n\n" +
-        "Requirements:\n" + "\n".join(structured_description["requirements"]) + "\n\n" +
-        "Tools:\n" + "\n".join(structured_description["tools"])
+        "Title:\n" + structured_description.title + "\n\n" +
+        "Summary:\n" + structured_description.summary + "\n\n" +
+        "Responsibilities:\n" + "\n".join(structured_description.responsibilities) + "\n\n" +
+        "Requirements:\n" + "\n".join(structured_description.requirements) + "\n\n" +
+        "Qualifications:\n" + "\n".join(structured_description.qualifications) + "\n\n" +
+        "Benefits:\n" + "\n".join(structured_description.benefits) + "\n\n" +
+        "Tools:\n" + "\n".join(structured_description.tools)
     )
+
     db.commit()
     db.refresh(job)
 
-#Sends the structured description back to the client (Postman, frontend, etc).
-    return {"job_id": job_id, "structured_description": structured_description}
+    return {"job_id": job_id, "structured_description": structured_description.model_dump()}
+
+# model_dump() is the Pydantic v2 method to serialize a model to a dictionary.
 
 
+# return the formatted string like the one saved to the database.
+# return {"job_id": job_id, "description": job.description}
 
 
 # Save only the summary into the description column of the JobPosting table.

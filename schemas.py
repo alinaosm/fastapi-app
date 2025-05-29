@@ -51,8 +51,15 @@ class JobPosting(JobPostingBase):
 
 class JobDescriptionRequest(BaseModel):
     required_tools: List[str]
+    company_culture: Optional[str] = None
 
-# class JobDescriptionResponse(BaseModel):
-#     job_id: int
-#     description: str
 
+# Define LangChain output schema
+class JobDescription(BaseModel):
+    title: str
+    summary: str
+    responsibilities: List[str]
+    requirements: List[str]
+    qualifications: Optional[List[str]] = None
+    benefits: Optional[List[str]] = None
+    tools: List[str]

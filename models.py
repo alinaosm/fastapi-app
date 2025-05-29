@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey, Enum, Text
 from sqlalchemy.orm import relationship
 import enum
 from session import Base
@@ -41,6 +41,6 @@ class JobPosting(Base):
     is_active = Column(Boolean, nullable=True)
     created_at = Column(String, nullable=True)
     # created_at = Column(DateTime, default=datetime.utcnow)
-    description = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
 
     company = relationship("Company", back_populates="job_postings") 
